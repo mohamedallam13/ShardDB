@@ -36,6 +36,7 @@ tests/                          ← Node tests (npm test)
   sharddb-extended.test.js
   sharddb-10k-comprehensive.test.js
   sharddb-partition.test.js     ← partition routing (38 tests, Groups A–G)
+  sharddb-lru.test.js           ← LRU eviction (25 tests, Groups A–E)
   sharddb-perf-matrix.js        ← standalone benchmark (not in npm test)
   helpers/
     mock-drive.js
@@ -84,13 +85,17 @@ db.setupPartitions(dbMain, partitionKeys[])
 `ctx` is always `{ dbMain, dbFragment?, partitionKey? }`.
 `partitionKey` in ctx activates partition routing for lookup operations.
 
+New options in `SHARD_DB.init(indexFileId, adapter, options)`:
+- `maxEntriesCount` (number, default 1000) — per-fragment row cap
+- `maxOpenFragments` (number, default Infinity) — LRU eviction cap for OPEN_DB
+
 ### 2. Run the Node test suite before and after any change to ShardDB.js
 
 ```bash
 npm test
 ```
 
-All 106 tests must pass. If you add new behaviour, add a test for it.
+All 131 tests must pass. If you add new behaviour, add a test for it.
 
 For large-scale correctness: `npm run test:heavy`
 For performance baselines: `npm run test:perf-matrix`
@@ -105,6 +110,8 @@ It runs:
   with full correctness checks and timing output
 - Group I: partition routing — setup, routing, targeted lookup, scan isolation,
   overflow, cross-partition isolation, in-place update, perf profiling
+- Group J: LRU eviction — maxOpenFragments cap, dirty auto-save, re-open after
+  eviction, multi-cycle correctness, size invariants
 
 After any change to `ShardDB.js`, push to GAS and run `runShardDbAssertionSuite`.
 Paste the execution log output here for review.
@@ -149,13 +156,49 @@ this separation.
 Lookups and in-place updates remain fast (0–5ms). Best for read-heavy, infrequent-save
 workloads with 10–50 partitions.
 
-### 5. OPEN_DB keys use a composite format
+### 5. LRU fragment eviction — maxOpenFragments
+
+**What it is**: an optional cap on how many fragment files can be held in OPEN_DB at once.
+When the limit is reached and a new fragment is opened, the least-recently-used fragment is
+auto-saved to Drive (if dirty) and removed from OPEN_DB before the new one is added.
+
+**How to enable**:
+```javascript
+const db = SHARD_DB.init(indexFileId, adapter, {
+  maxOpenFragments: 20   // keep at most 20 fragments in memory at once
+});
+```
+
+**Default**: `Infinity` — no eviction. All existing callers are completely unaffected.
+
+**Key guarantees**:
+- Dirty fragments are always written to Drive before eviction — no silent data loss.
+- Clean fragments are evicted with zero Drive writes.
+- After eviction, the next access to that fragment triggers one Drive re-read (cache miss).
+- `_lru.size` never exceeds `maxOpenFragments`.
+
+**Implementation**: `LRUTracker` (doubly-linked list + plain-object hash, O(1) all ops, ES5).
+- `_lru` is exposed on the returned DB object for test introspection — do not mutate externally.
+- `maxOpenFragments` is also exposed on the returned object.
+
+**Wired into**:
+- `addToOpenDBsObj` — add new entry + trigger eviction if over capacity
+- `openDBFragment` — touch (promote to MRU) on every cache hit
+- `closeFragment` — remove from LRU tracker
+- `destroyFragment` — remove from LRU tracker
+
+**When to use**: long-running GAS scripts that open many fragments (e.g. multi-table scans,
+bulk imports). A cap of 20–50 fragments is safe for most workloads. Set too low and you'll
+incur extra Drive reads; set too high and you risk hitting GAS memory limits with very large
+fragment files.
+
+### 6. OPEN_DB keys use a composite format
 
 `OPEN_DB` is keyed by `dbMain + "\x00" + dbFragment`, not by `dbFragment` alone.
 Always use `openDbKey(dbMain, dbFragment)` — never access `OPEN_DB[fragmentName]` directly.
 This prevents silent collision when two tables share the same fragment suffix.
 
-### 6. indexRoutingDirty controls whether the INDEX is rewritten on save
+### 7. indexRoutingDirty controls whether the INDEX is rewritten on save
 
 Set it `true` when: new row, key change, fragment created/destroyed, clearDB, destroyDB, addExternalConfig.
 Leave it `false` for: pure in-place value update (same id + same key, already routed to correct fragment).
@@ -163,12 +206,12 @@ Leave it `false` for: pure in-place value update (same id + same key, already ro
 Do not set this flag unconditionally — the entire point of this optimisation is to avoid
 rewriting the INDEX on every save when routing hasn't changed.
 
-### 7. Fragment files are the unit of Drive I/O
+### 8. Fragment files are the unit of Drive I/O
 
 One Drive API call per fragment per save. This is the dominant cost (~300–600ms per call on GAS).
 Design changes that affect how many fragments are written on a save have a direct performance impact.
 
-### 8. Adapter interface
+### 9. Adapter interface
 
 Any custom adapter must implement exactly these four methods:
 
