@@ -1,4 +1,7 @@
 node_modules/
 tests/.mock_drive/
+tests/.mock_drive_*/
+.mock_drive_debug/
+.mock_drive_partition_*/
 tests/benchmark-results.csv
 tests/benchmark-results.mmd

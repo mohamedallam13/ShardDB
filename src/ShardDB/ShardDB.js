@@ -111,6 +111,89 @@
     return String(key);
   }
 
+  /**
+   * Doubly-linked list node used by the LRU tracker.
+   * `key` is the composite OPEN_DB key (dbMain + "\x00" + dbFragment).
+   */
+  function LRUNode(key) {
+    this.key  = key;
+    this.prev = null;
+    this.next = null;
+  }
+
+  /**
+   * O(1) LRU tracker backed by a plain-object hash map + doubly-linked list.
+   * Compatible with GAS ES5 (no Map/Set required).
+   *
+   * Head  = most-recently used.
+   * Tail  = least-recently used (eviction candidate).
+   *
+   * @param {number} capacity  Maximum number of entries (Infinity = no limit).
+   */
+  function LRUTracker(capacity) {
+    this.capacity = (capacity > 0 && Number.isFinite(capacity)) ? capacity : Infinity;
+    this.size     = 0;
+    this.nodes    = {};   // key → LRUNode
+    // Sentinel nodes avoid null-checks everywhere.
+    this._head    = new LRUNode("__head__");
+    this._tail    = new LRUNode("__tail__");
+    this._head.next = this._tail;
+    this._tail.prev = this._head;
+  }
+
+  LRUTracker.prototype._detach = function (node) {
+    node.prev.next = node.next;
+    node.next.prev = node.prev;
+    node.prev = null;
+    node.next = null;
+  };
+
+  LRUTracker.prototype._insertAfterHead = function (node) {
+    node.next = this._head.next;
+    node.prev = this._head;
+    this._head.next.prev = node;
+    this._head.next = node;
+  };
+
+  /** Add a new key (must not already exist). */
+  LRUTracker.prototype.add = function (key) {
+    var node = new LRUNode(key);
+    this.nodes[key] = node;
+    this._insertAfterHead(node);
+    this.size++;
+  };
+
+  /** Promote an existing key to MRU position. No-op if key not tracked. */
+  LRUTracker.prototype.touch = function (key) {
+    var node = this.nodes[key];
+    if (!node) return;
+    this._detach(node);
+    this._insertAfterHead(node);
+  };
+
+  /** Remove a key from tracking. No-op if not tracked. */
+  LRUTracker.prototype.remove = function (key) {
+    var node = this.nodes[key];
+    if (!node) return;
+    this._detach(node);
+    delete this.nodes[key];
+    this.size--;
+  };
+
+  /** Return the LRU (tail) key, or null if empty. */
+  LRUTracker.prototype.lruKey = function () {
+    var tail = this._tail.prev;
+    if (tail === this._head) return null;
+    return tail.key;
+  };
+
+  /** Return the MRU (head) key, or null if empty. */
+  LRUTracker.prototype.mruKey = function () {
+    var head = this._head.next;
+    if (head === this._tail) return null;
+    return head.key;
+  };
+
   function init(indexFileId, ToolkitAdapter, options) {
     if (!indexFileId) return null;
     if (!ToolkitAdapter || typeof ToolkitAdapter.readFromJSON !== "function") {
@@ -129,6 +212,52 @@
      * The caller must pass the same `partitionBy` map on every init() call.
      */
     var PARTITION_FNS = options.partitionBy || {};
+
+    /**
+     * LRU eviction for OPEN_DB.
+     *
+     * `maxOpenFragments` caps how many fragment files can be held in memory at once.
+     * When the limit is reached and a new fragment is opened, the least-recently-used
+     * fragment is auto-saved (if dirty) and evicted from OPEN_DB before the new one
+     * is added.  Default is Infinity (no eviction) so existing callers are unaffected.
+     */
+    var instanceMaxOpenFragments =
+      options.maxOpenFragments != null && Number.isFinite(Number(options.maxOpenFragments)) &&
+      Number(options.maxOpenFragments) > 0
+        ? Number(options.maxOpenFragments)
+        : Infinity;
+    var LRU = new LRUTracker(instanceMaxOpenFragments);
+
+    /**
+     * Evict the LRU fragment from OPEN_DB when the capacity is exceeded.
+     * If the fragment is dirty, it is written to Drive before removal so no
+     * data is silently lost.  Called from addToOpenDBsObj before inserting a
+     * new entry.
+     */
+    function evictLRUIfNeeded() {
+      if (!Number.isFinite(LRU.capacity)) return;          // no limit — fast path
+      while (LRU.size >= LRU.capacity) {
+        var lruKey = LRU.lruKey();
+        if (!lruKey) break;
+        var evicted = OPEN_DB[lruKey];
+        if (evicted && evicted.properties.isChanged) {
+          // Auto-save dirty evicted fragment to Drive.
+          var main     = evicted.properties.main;
+          var fragment = evicted.properties.fragment;
+          var fileId   = INDEX[main] &&
+                         INDEX[main].dbFragments[fragment] &&
+                         INDEX[main].dbFragments[fragment].fileId;
+          if (fileId === "") {
+            createNewFile(main, fragment, evicted.toWrite);
+          } else if (fileId) {
+            ToolkitAdapter.writeToJSON(fileId, evicted.toWrite);
+          }
+          evicted.properties.isChanged = false;
+        }
+        LRU.remove(lruKey);
+        delete OPEN_DB[lruKey];
+      }
+    }
 
     function initiateDB() {
       return ToolkitAdapter.readFromJSON(indexFileId);
@@ -389,7 +518,10 @@
 
     function closeFragment(dbMain, dbFragment) {
       var k = openDbKey(dbMain, dbFragment);
-      if (OPEN_DB[k]) delete OPEN_DB[k];
+      if (OPEN_DB[k]) {
+        delete OPEN_DB[k];
+        LRU.remove(k);
+      }
     }
 
     function clearDB({ dbMain, dbFragment }) {
@@ -450,7 +582,10 @@
       delete INDEX[dbMain].dbFragments[dbFragment];
       pull(dbFragment, fragmentsList);
       var k = openDbKey(dbMain, dbFragment);
-      if (OPEN_DB[k]) delete OPEN_DB[k];
+      if (OPEN_DB[k]) {
+        delete OPEN_DB[k];
+        LRU.remove(k);
+      }
       rebuildIdRangeSorted(dbMain);
       markIndexRoutingDirty(dbMain);
     }
@@ -936,7 +1071,10 @@
 
     function openDBFragment(dbMain, dbFragment) {
       var k = openDbKey(dbMain, dbFragment);
-      if (OPEN_DB[k]) return true;
+      if (OPEN_DB[k]) {
+        LRU.touch(k);   // promote to MRU on every access
+        return true;
+      }
       if (!INDEX[dbMain].dbFragments[dbFragment]) return false;
       let fragmentFileObj;
       const { fileId } = INDEX[dbMain].dbFragments[dbFragment];
@@ -947,8 +1085,10 @@
 
     function addToOpenDBsObj(dbMain, dbFragment, fragmentFileObj) {
       var k = openDbKey(dbMain, dbFragment);
+      evictLRUIfNeeded();
       OPEN_DB[k] = new OpenDBEntry(dbMain, fragmentFileObj);
       OPEN_DB[k].properties.fragment = dbFragment;
+      LRU.add(k);
     }
 
     /**
@@ -1257,7 +1397,10 @@
         isPartitioned: isPartitioned,
         partitionFragmentForKey: partitionFragmentForKey
       },
-      maxEntriesCount: instanceMaxEntries
+      /** @internal LRU tracker — exposed for tests; do not mutate externally */
+      _lru: LRU,
+      maxEntriesCount: instanceMaxEntries,
+      maxOpenFragments: instanceMaxOpenFragments
     };
   }
 

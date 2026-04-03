@@ -2027,6 +2027,110 @@
     });
 
     Logger.log("── Group I complete ──\n");
+
+    // ── J. LRU fragment eviction ─────────────────────────────────────────────
+
+    Logger.log("\n── Group J: LRU fragment eviction — real Drive ──\n");
+
+    run("J1: maxOpenFragments defaults to Infinity — no eviction by default", function () {
+      var ctx = makeAssertDB(realDrive, emptyAssertIndex("j1"));
+      indexIdsToTrash.push(ctx.indexFileId);
+      var db = ctx.db;
+      assertEqual(db.maxOpenFragments, Infinity, "J1: default maxOpenFragments must be Infinity");
+      db.destroyDB({ dbMain: "USERS" });
+    });
+
+    run("J2: _lru.size tracks open fragments", function () {
+      var ctx = makeAssertDB(realDrive, emptyAssertIndex("j2"), { maxEntriesCount: 1 });
+      indexIdsToTrash.push(ctx.indexFileId);
+      var db = ctx.db;
+      assertEqual(db._lru.size, 0, "J2: lru.size must be 0 before any fragment is opened");
+      db.addToDB({ id: 1, key: "k1" }, { dbMain: "USERS" });
+      assertEqual(db._lru.size, 1, "J2: lru.size must be 1 after first fragment is opened");
+      db.addToDB({ id: 2, key: "k2" }, { dbMain: "USERS" });
+      assertEqual(db._lru.size, 2, "J2: lru.size must be 2 after second fragment is opened");
+      db.destroyDB({ dbMain: "USERS" });
+    });
+
+    run("J3: eviction removes LRU fragment from OPEN_DB", function () {
+      var ctx = makeAssertDB(realDrive, emptyAssertIndex("j3"), { maxEntriesCount: 1, maxOpenFragments: 1 });
+      indexIdsToTrash.push(ctx.indexFileId);
+      var db = ctx.db;
+      db.addToDB({ id: 1, key: "k1" }, { dbMain: "USERS" });
+      db.saveToDBFiles();
+      // Adding id=2 opens USERS_2 → evicts USERS_1 (LRU, clean)
+      db.addToDB({ id: 2, key: "k2" }, { dbMain: "USERS" });
+      var k1 = db._routing.openDbKey("USERS", "USERS_1");
+      assert(db.OPEN_DB[k1] === undefined, "J3: USERS_1 must have been evicted from OPEN_DB");
+      assertEqual(db._lru.size, 1, "J3: lru.size must be 1 (=maxOpenFragments)");
+      db.destroyDB({ dbMain: "USERS" });
+    });
+
+    run("J4: dirty evicted fragment is auto-saved and data survives re-open", function () {
+      var ctx = makeAssertDB(realDrive, emptyAssertIndex("j4"), { maxEntriesCount: 1, maxOpenFragments: 1 });
+      indexIdsToTrash.push(ctx.indexFileId);
+      var db = ctx.db;
+      db.addToDB({ id: 1, key: "k1", value: "original" }, { dbMain: "USERS" });
+      db.saveToDBFiles(); // give USERS_1 a real Drive file
+      db.addToDB({ id: 1, key: "k1", value: "dirty_update" }, { dbMain: "USERS" }); // mark dirty
+      // Evict USERS_1 (dirty) by opening USERS_2
+      db.addToDB({ id: 2, key: "k2" }, { dbMain: "USERS" });
+      db.saveToDBFiles();
+      // Re-read after eviction
+      var row = db.lookUpByKey("k1", { dbMain: "USERS" });
+      assertNotNull(row, "J4: row must survive dirty eviction and re-open from Drive");
+      assertEqual(row.value, "dirty_update", "J4: auto-saved value must be intact after re-open");
+      db.destroyDB({ dbMain: "USERS" });
+    });
+
+    run("J5: lookUpByKey works after target fragment was evicted", function () {
+      var ctx = makeAssertDB(realDrive, emptyAssertIndex("j5"), { maxEntriesCount: 1, maxOpenFragments: 1 });
+      indexIdsToTrash.push(ctx.indexFileId);
+      var db = ctx.db;
+      db.addToDB({ id: 1, key: "find_me", value: "here" }, { dbMain: "USERS" });
+      db.saveToDBFiles();
+      db.addToDB({ id: 2, key: "k2" }, { dbMain: "USERS" }); // evict USERS_1
+      db.saveToDBFiles();
+      var row = db.lookUpByKey("find_me", { dbMain: "USERS" });
+      assertNotNull(row, "J5: lookUpByKey must work after fragment eviction");
+      assertEqual(row.value, "here", "J5: value must be intact after Drive re-read");
+      db.destroyDB({ dbMain: "USERS" });
+    });
+
+    run("J6: multi-cycle eviction — N+5 fragments with cap N — all data intact", function () {
+      var N = 3;
+      var ctx = makeAssertDB(realDrive, emptyAssertIndex("j6"), { maxEntriesCount: 1, maxOpenFragments: N });
+      indexIdsToTrash.push(ctx.indexFileId);
+      var db = ctx.db;
+      var total = N + 5;
+      for (var i = 1; i <= total; i++) {
+        db.addToDB({ id: i, key: "mk" + i, value: "val" + i }, { dbMain: "USERS" });
+        db.saveToDBFiles();
+      }
+      // Verify all rows via a fresh init (no LRU limit)
+      var db2 = SHARD_DB.init(ctx.indexFileId, realDrive, {});
+      for (var j = 1; j <= total; j++) {
+        var row = db2.lookUpByKey("mk" + j, { dbMain: "USERS" });
+        assertNotNull(row, "J6: row mk" + j + " must survive multi-cycle eviction");
+        assertEqual(row.value, "val" + j, "J6: value must be intact for mk" + j);
+      }
+      db2.destroyDB({ dbMain: "USERS" });
+    });
+
+    run("J7: LRU size never exceeds maxOpenFragments across many writes", function () {
+      var ctx = makeAssertDB(realDrive, emptyAssertIndex("j7"), { maxEntriesCount: 1, maxOpenFragments: 2 });
+      indexIdsToTrash.push(ctx.indexFileId);
+      var db = ctx.db;
+      for (var i = 1; i <= 8; i++) {
+        db.addToDB({ id: i, key: "lk" + i }, { dbMain: "USERS" });
+        db.saveToDBFiles();
+        assert(db._lru.size <= 2, "J7: lru.size exceeded 2 at i=" + i);
+      }
+      db.destroyDB({ dbMain: "USERS" });
+    });
+
+    Logger.log("── Group J complete ──\n");
+    Logger.log("=== ALL " + passed + " TESTS PASSED ===");
   }
 
   return {
@@ -2070,7 +2174,8 @@ function runShardDbFullBenchmarkSuiteWith100k() {
 }
 
 /**
- * Entry: assertion suite — all bug-fix checks + full API round-trip + backup/restore + partition tests.
+ * Entry: assertion suite — all bug-fix checks + full API round-trip + backup/restore +
+ * partition tests + LRU eviction tests.
  * Throws on first failure. Configure SHARDDB_TEST_FOLDER_ID in Script Properties
  * to point at your test folder (or leave it unset to use the hardcoded fallback).
  */
@@ -2105,6 +2210,33 @@ function runShardDbAssertionSuite() {
  * Filter the execution log for "Group I" lines to focus on partition results.
  */
 function runShardDbPartitionSuite() {
+  if (typeof SHARD_DB_TESTS === "undefined") {
+    throw new Error("FATAL: SHARD_DB_TESTS not defined — check library load order.");
+  }
+  if (typeof SHARD_DB_TOOLKIT === "undefined") {
+    throw new Error("FATAL: SHARD_DB_TOOLKIT not defined — ShardDBToolkitHelpers.js must be loaded.");
+  }
+  SHARD_DB_TESTS.runAssertionSuite();
+}
+
+/**
+ * Entry: full assertion suite including Group J LRU eviction tests.
+ *
+ * This is an alias for runShardDbAssertionSuite() that makes it explicit you
+ * want to run Groups A–J. Group J covers LRU eviction on real Drive:
+ *   J1  — maxOpenFragments defaults to Infinity (no eviction by default)
+ *   J2  — _lru.size tracks open fragments correctly
+ *   J3  — eviction removes LRU fragment from OPEN_DB
+ *   J4  — dirty evicted fragment is auto-saved; data survives re-open
+ *   J5  — lookUpByKey works after target fragment was evicted and re-read
+ *   J6  — multi-cycle eviction with cap N: all data intact after N+5 fragments
+ *   J7  — LRU size never exceeds maxOpenFragments across many writes
+ *
+ * Configure SHARDDB_TEST_FOLDER_ID in Script Properties before running.
+ * Each run is self-cleaning — all ephemeral INDEX and fragment files are trashed.
+ * Filter the execution log for "Group J" lines to focus on LRU results.
+ */
+function runShardDbLruSuite() {
   if (typeof SHARD_DB_TESTS === "undefined") {
     throw new Error("FATAL: SHARD_DB_TESTS not defined — check library load order.");
   }

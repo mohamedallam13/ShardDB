@@ -4,7 +4,8 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "node --test --test-concurrency=1 tests/sharddb-gas-fakes.test.js tests/sharddb.test.js tests/sharddb-extended.test.js tests/sharddb-index-routing-dirty.test.js tests/sharddb-correctness-gaps.test.js tests/sharddb-operation-coverage.test.js tests/sharddb-partition.test.js",
+    "test": "node --test --test-concurrency=1 tests/sharddb-gas-fakes.test.js tests/sharddb.test.js tests/sharddb-extended.test.js tests/sharddb-index-routing-dirty.test.js tests/sharddb-correctness-gaps.test.js tests/sharddb-operation-coverage.test.js tests/sharddb-partition.test.js tests/sharddb-lru.test.js",
+    "test:lru": "node --test tests/sharddb-lru.test.js",
     "test:partition": "node --test tests/sharddb-partition.test.js",
     "test:gas-fakes": "node --test tests/sharddb-gas-fakes.test.js",
     "test:heavy": "node --test tests/sharddb-10k-comprehensive.test.js",
