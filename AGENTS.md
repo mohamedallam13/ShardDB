@@ -35,6 +35,7 @@ tests/                          ← Node tests (npm test)
   sharddb-operation-coverage.test.js
   sharddb-extended.test.js
   sharddb-10k-comprehensive.test.js
+  sharddb-partition.test.js     ← partition routing (38 tests, Groups A–G)
   sharddb-perf-matrix.js        ← standalone benchmark (not in npm test)
   helpers/
     mock-drive.js
@@ -77,9 +78,11 @@ db.getIndexFootprint(ctx?)
 db.validateRoutingConsistency(ctx)
 db.addExternalConfig(key, value, ctx)
 db.getExternalConfig(key, ctx)
+db.setupPartitions(dbMain, partitionKeys[])
 ```
 
-`ctx` is always `{ dbMain, dbFragment? }`.
+`ctx` is always `{ dbMain, dbFragment?, partitionKey? }`.
+`partitionKey` in ctx activates partition routing for lookup operations.
 
 ### 2. Run the Node test suite before and after any change to ShardDB.js
 
@@ -87,7 +90,7 @@ db.getExternalConfig(key, ctx)
 npm test
 ```
 
-All 68 tests must pass. If you add new behaviour, add a test for it.
+All 106 tests must pass. If you add new behaviour, add a test for it.
 
 For large-scale correctness: `npm run test:heavy`
 For performance baselines: `npm run test:perf-matrix`
@@ -100,6 +103,8 @@ It runs:
 - Groups A–G: correctness assertions for all known bugs and edge cases
 - Group H: 7-phase nominal-ops flow at scales 100 / 1k / 10k / 50k / 100k
   with full correctness checks and timing output
+- Group I: partition routing — setup, routing, targeted lookup, scan isolation,
+  overflow, cross-partition isolation, in-place update, perf profiling
 
 After any change to `ShardDB.js`, push to GAS and run `runShardDbAssertionSuite`.
 Paste the execution log output here for review.
@@ -109,13 +114,48 @@ Push command (requires cc clasp credentials):
 clasp -A "$HOME/.clasp/cc.clasprc.json" push
 ```
 
-### 4. OPEN_DB keys use a composite format
+### 4. Partition routing — critical design constraints
+
+**What it is**: an optional mode where each semantic key (e.g. `eventId`) gets its own named Drive
+fragment from the first write, enabling targeted lookups that skip the INDEX entirely.
+
+**How to enable**:
+```javascript
+const db = SHARD_DB.init(indexFileId, adapter, {
+  partitionBy: { EVENTS: (entry) => entry.eventId }
+});
+db.setupPartitions('EVENTS', allEventIds);  // pre-create base fragments (idempotent)
+```
+
+**Targeted lookup** — pass `partitionKey` in ctx to skip all other partitions' Drive files:
+```javascript
+db.lookUpByKey('row-key', { dbMain: 'EVENTS', partitionKey: 'event-42' });
+db.lookUpById(7, { dbMain: 'EVENTS', partitionKey: 'event-42' });
+db.lookupByCriteria({ field: 'x' }, { dbMain: 'EVENTS', partitionKey: 'event-42' });
+```
+
+**CRITICAL — overlapping id-ranges**: partition id-ranges overlap across different partitions
+by design (two events can both have rows with ids 1–1000). The global `findFragmentForId`
+binary search assumes disjoint ranges and **must never be used** for partition routing.
+The functions `resolvePartitionFragment`, `lookUpByIdInPartition`, and
+`validateRoutingConsistency` all account for this. If you touch id-range logic, preserve
+this separation.
+
+**`partitionBy` functions cannot be serialized to JSON** — they must be re-supplied on every
+`init()` call. Do not attempt to persist them in the INDEX.
+
+**Performance trade-off**: each partition = one separate Drive write on save (~1,000ms each).
+50 partitions with 20 rows each = ~48s save time vs ~2s for the same 1,000 rows cumulative.
+Lookups and in-place updates remain fast (0–5ms). Best for read-heavy, infrequent-save
+workloads with 10–50 partitions.
+
+### 5. OPEN_DB keys use a composite format
 
 `OPEN_DB` is keyed by `dbMain + "\x00" + dbFragment`, not by `dbFragment` alone.
 Always use `openDbKey(dbMain, dbFragment)` — never access `OPEN_DB[fragmentName]` directly.
 This prevents silent collision when two tables share the same fragment suffix.
 
-### 5. indexRoutingDirty controls whether the INDEX is rewritten on save
+### 6. indexRoutingDirty controls whether the INDEX is rewritten on save
 
 Set it `true` when: new row, key change, fragment created/destroyed, clearDB, destroyDB, addExternalConfig.
 Leave it `false` for: pure in-place value update (same id + same key, already routed to correct fragment).
@@ -123,12 +163,12 @@ Leave it `false` for: pure in-place value update (same id + same key, already ro
 Do not set this flag unconditionally — the entire point of this optimisation is to avoid
 rewriting the INDEX on every save when routing hasn't changed.
 
-### 6. Fragment files are the unit of Drive I/O
+### 7. Fragment files are the unit of Drive I/O
 
 One Drive API call per fragment per save. This is the dominant cost (~300–600ms per call on GAS).
 Design changes that affect how many fragments are written on a save have a direct performance impact.
 
-### 7. Adapter interface
+### 8. Adapter interface
 
 Any custom adapter must implement exactly these four methods:
 
