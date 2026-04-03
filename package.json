@@ -1,0 +1,26 @@
+{
+  "name": "jsondatabase",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "node --test --test-concurrency=1 tests/sharddb-gas-fakes.test.js tests/sharddb.test.js tests/sharddb-extended.test.js tests/sharddb-index-routing-dirty.test.js tests/sharddb-correctness-gaps.test.js",
+    "test:gas-fakes": "node --test tests/sharddb-gas-fakes.test.js",
+    "test:heavy": "node --test tests/sharddb-10k-comprehensive.test.js",
+    "test:drive": "node --test tests/sharddb-drive-integration.test.js",
+    "test:drive:perf": "SHARDDB_PERF_ROWS=200 node --test tests/sharddb-drive-integration.test.js",
+    "test:all": "npm run test && npm run test:heavy",
+    "benchmark": "node tests/benchmark.js",
+    "benchmark:perf": "node tests/sharddb-benchmark-performance.js",
+    "benchmark:perf:full": "node tests/sharddb-benchmark-performance.js --full",
+    "benchmark:incremental": "node tests/sharddb-benchmark-incremental-save.js",
+    "benchmark:incremental:50k": "node tests/sharddb-benchmark-incremental-save.js --n=50000"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@mcpher/gas-fakes": "^2.3.4"
+  }
+}

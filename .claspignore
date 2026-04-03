@@ -1,0 +1,8 @@
+**/node_modules/**
+**/.mock_drive/**
+**/*.test.js
+**/node-stress-test.js
+package.json
+package-lock.json
+gasfakes.json
+readme.md

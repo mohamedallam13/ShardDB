@@ -1,0 +1,14 @@
+{
+  "$schema": "../registry/gas-package.schema.json",
+  "name": "ShardDB",
+  "description": "ShardDB (formerly JSONDatabase). A highly scalable, chunked NoSQL document database layered directly over Google Drive equipped with CacheService.",
+  "version": "1.0.0",
+  "dependencies": {
+    "googleAdvancedServices": [],
+    "internalLibraries": [],
+    "externalLibraries": []
+  },
+  "requiredOauthScopes": [
+    "https://www.googleapis.com/auth/drive"
+  ]
+}

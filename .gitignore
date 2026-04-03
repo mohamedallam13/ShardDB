@@ -1,0 +1,4 @@
+node_modules/
+tests/.mock_drive/
+tests/benchmark-results.csv
+tests/benchmark-results.mmd

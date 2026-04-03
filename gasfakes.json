@@ -1,0 +1,8 @@
+{
+  "manifest": "./src/appsscript.json",
+  "clasp": "./.clasp.json",
+  "documentId": null,
+  "cache": "/tmp/gas-fakes/sharddb/cache",
+  "properties": "/tmp/gas-fakes/sharddb/properties",
+  "scriptId": "sharddb-local-dev"
+}
