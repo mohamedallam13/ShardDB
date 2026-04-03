@@ -26,6 +26,17 @@
  * 21.  lookUpById on empty DB returns null (no crash)
  * 22.  lookUpByKey on unknown key returns null (no crash)
  * 23.  Multi-fragment: update row in first fragment after second has been created
+ *
+ * NEW TESTS (array path + persistence round-trips + double-flush):
+ * 24.  getValueFromPath: array with match at index > 0 (was broken, now fixed)
+ * 25.  getValueFromPath: array with NO matching element returns undefined (no crash)
+ * 26.  getValueFromPath: nested array at intermediate depth, match at index 2
+ * 27.  Persistence round-trip: delete → reload — deleted row absent after reinit
+ * 28.  Persistence round-trip: key-change → reload — new key resolves, old key absent
+ * 29.  Persistence round-trip: multi-fragment → reload — all fragments reload and route correctly
+ * 30.  Persistence round-trip: dirty-skip optimisation — pure update (same key+id) does not rewrite INDEX
+ * 31.  Double-flush no-op: saveToDBFiles() twice with no intervening mutation does zero adapter writes
+ * 32.  maxEntriesCount option: init with maxEntriesCount=5 creates new fragment at 5 rows
  */
 
 const { describe, it, before, beforeEach } = require("node:test");
@@ -141,7 +152,7 @@ describe("ShardDB correctness gaps", () => {
     assert.equal(DB.INDEX.USERS.properties.keyToFragment.newKey, "USERS_1");
 
     // fragment index (tw.index)
-    const tw = DB.OPEN_DB.USERS_1.toWrite;
+    const tw = DB.OPEN_DB[DB._routing.openDbKey("USERS", "USERS_1")].toWrite;
     assert.equal(tw.index.oldKey, undefined, "old key must be removed from fragment index");
     assert.equal(tw.index.newKey, 10, "new key must be in fragment index");
 
@@ -154,11 +165,11 @@ describe("ShardDB correctness gaps", () => {
   it("deleteFromDBById removes the key from the fragment index", () => {
     const DB = makeDB(mock);
     DB.addToDB({ key: "z", id: 5, v: 1 }, { dbMain: "USERS" });
-    assert.equal(DB.OPEN_DB.USERS_1.toWrite.index.z, 5);
+    assert.equal(DB.OPEN_DB[DB._routing.openDbKey("USERS", "USERS_1")].toWrite.index.z, 5);
 
     DB.deleteFromDBById(5, { dbMain: "USERS" });
 
-    const tw = DB.OPEN_DB.USERS_1.toWrite;
+    const tw = DB.OPEN_DB[DB._routing.openDbKey("USERS", "USERS_1")].toWrite;
     assert.equal(tw.index.z, undefined, "key must be gone from fragment index after delete-by-id");
     assert.equal(tw.data[5], undefined);
     assert.equal(DB.lookUpById(5, { dbMain: "USERS" }), null);
@@ -169,11 +180,11 @@ describe("ShardDB correctness gaps", () => {
   it("deleteFromDBByKey removes the key from the fragment index", () => {
     const DB = makeDB(mock);
     DB.addToDB({ key: "y", id: 7, v: 1 }, { dbMain: "USERS" });
-    assert.equal(DB.OPEN_DB.USERS_1.toWrite.index.y, 7);
+    assert.equal(DB.OPEN_DB[DB._routing.openDbKey("USERS", "USERS_1")].toWrite.index.y, 7);
 
     DB.deleteFromDBByKey("y", { dbMain: "USERS" });
 
-    const tw = DB.OPEN_DB.USERS_1.toWrite;
+    const tw = DB.OPEN_DB[DB._routing.openDbKey("USERS", "USERS_1")].toWrite;
     assert.equal(tw.index.y, undefined, "key must be gone from fragment index after delete-by-key");
     assert.equal(tw.data[7], undefined);
     assert.equal(DB.lookUpByKey("y", { dbMain: "USERS" }), null);
@@ -273,17 +284,17 @@ describe("ShardDB correctness gaps", () => {
     }
     DB.saveToDBFiles();
 
-    assert.ok(DB.OPEN_DB.USERS_1);
-    assert.ok(DB.OPEN_DB.USERS_2);
+    assert.ok(DB.OPEN_DB[DB._routing.openDbKey("USERS", "USERS_1")]);
+    assert.ok(DB.OPEN_DB[DB._routing.openDbKey("USERS", "USERS_2")]);
 
     DB.closeDB({ dbMain: "USERS", dbFragment: "USERS_1" });
-    assert.equal(DB.OPEN_DB.USERS_1, undefined, "USERS_1 should be evicted");
-    assert.ok(DB.OPEN_DB.USERS_2, "USERS_2 should still be open");
+    assert.equal(DB.OPEN_DB[DB._routing.openDbKey("USERS", "USERS_1")], undefined, "USERS_1 should be evicted");
+    assert.ok(DB.OPEN_DB[DB._routing.openDbKey("USERS", "USERS_2")], "USERS_2 should still be open");
 
     // USERS_1 reloads on next access
     const row = DB.lookUpById(1, { dbMain: "USERS" });
     assert.equal(row.n, 1);
-    assert.ok(DB.OPEN_DB.USERS_1);
+    assert.ok(DB.OPEN_DB[DB._routing.openDbKey("USERS", "USERS_1")]);
   });
 
   // ── 16. getIndexFootprint without dbMain (full INDEX) ─────────────────────────────────
@@ -393,6 +404,179 @@ describe("ShardDB correctness gaps", () => {
     assert.equal(DB._routing.findFragmentForId(1, "USERS"), "USERS_1");
     assert.equal(DB._routing.findFragmentForId(cap + 1, "USERS"), "USERS_2");
 
+    const v = DB.validateRoutingConsistency({ dbMain: "USERS" });
+    assert.equal(v.ok, true, v.errors.join("; "));
+  });
+
+  // ── 24. getValueFromPath: array with match at index > 0 ──────────────────────────────
+  it("lookupByCriteria finds value in an array element at index > 0", () => {
+    const DB = makeDB(mock);
+    // metrics is an array; the matching clearance is at index 1 (not 0)
+    DB.addToDB({
+      key: "a", id: 1,
+      profile: {
+        metrics: [
+          { clearance: "L1", score: 10 },
+          { clearance: "L2", score: 20 }
+        ]
+      }
+    }, { dbMain: "USERS" });
+    DB.addToDB({
+      key: "b", id: 2,
+      profile: {
+        metrics: [
+          { clearance: "L1", score: 5 }
+        ]
+      }
+    }, { dbMain: "USERS" });
+
+    const rows = DB.lookupByCriteria(
+      [{ path: ["profile", "metrics"], param: "clearance", criterion: "L2" }],
+      { dbMain: "USERS" }
+    );
+    assert.equal(rows.length, 1, "should find the row where clearance L2 is at index 1");
+    assert.equal(rows[0].key, "a");
+  });
+
+  // ── 25. getValueFromPath: array with NO matching element returns undefined ─────────────
+  it("lookupByCriteria returns no rows when array element matching param is absent", () => {
+    const DB = makeDB(mock);
+    DB.addToDB({
+      key: "a", id: 1,
+      tags: [{ type: "color", value: "red" }, { type: "size", value: "large" }]
+    }, { dbMain: "USERS" });
+
+    // Looking for param "missing_field" — none of the tag objects have it
+    const rows = DB.lookupByCriteria(
+      [{ path: ["tags"], param: "missing_field", criterion: "anything" }],
+      { dbMain: "USERS" }
+    );
+    assert.equal(rows.length, 0, "no rows when array has no element with the target param");
+  });
+
+  // ── 26. getValueFromPath: nested array at intermediate depth, match at index 2 ────────
+  it("lookupByCriteria resolves nested intermediate array match at index 2", () => {
+    const DB = makeDB(mock);
+    // sections is an array; item at index 2 contains the role we need
+    DB.addToDB({
+      key: "a", id: 1,
+      data: {
+        sections: [
+          { role: "viewer" },
+          { role: "editor" },
+          { role: "owner" }
+        ]
+      }
+    }, { dbMain: "USERS" });
+    DB.addToDB({
+      key: "b", id: 2,
+      data: {
+        sections: [
+          { role: "viewer" }
+        ]
+      }
+    }, { dbMain: "USERS" });
+
+    const rows = DB.lookupByCriteria(
+      [{ path: ["data", "sections"], param: "role", criterion: "owner" }],
+      { dbMain: "USERS" }
+    );
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].key, "a");
+  });
+
+  // ── 27. Persistence round-trip: delete → reload ───────────────────────────────────────
+  it("deleted row is absent after save → new init", () => {
+    const DB = makeDB(mock);
+    DB.addToDB({ key: "keep", id: 1, v: 1 }, { dbMain: "USERS" });
+    DB.addToDB({ key: "gone", id: 2, v: 2 }, { dbMain: "USERS" });
+    DB.deleteFromDBById(2, { dbMain: "USERS" });
+    DB.saveToDBFiles();
+
+    const DB2 = SHARD_DB.init(INDEX_ID, mock.adapter);
+    assert.equal(DB2.lookUpById(1, { dbMain: "USERS" }).v, 1, "kept row should survive");
+    assert.equal(DB2.lookUpById(2, { dbMain: "USERS" }), null, "deleted row must be absent");
+    assert.equal(DB2.lookUpByKey("gone", { dbMain: "USERS" }), null, "deleted key must be absent");
+    const v = DB2.validateRoutingConsistency({ dbMain: "USERS" });
+    assert.equal(v.ok, true, v.errors.join("; "));
+  });
+
+  // ── 28. Persistence round-trip: key-change → reload ──────────────────────────────────
+  it("key-change survives a save → new init cycle", () => {
+    const DB = makeDB(mock);
+    DB.addToDB({ key: "oldKey", id: 10, v: 1 }, { dbMain: "USERS" });
+    DB.addToDB({ key: "newKey", id: 10, v: 2 }, { dbMain: "USERS" }); // key change
+    DB.saveToDBFiles();
+
+    const DB2 = SHARD_DB.init(INDEX_ID, mock.adapter);
+    assert.equal(DB2.lookUpByKey("newKey", { dbMain: "USERS" }).v, 2, "new key must be resolved");
+    assert.equal(DB2.lookUpByKey("oldKey", { dbMain: "USERS" }), null, "old key must be absent");
+    const v = DB2.validateRoutingConsistency({ dbMain: "USERS" });
+    assert.equal(v.ok, true, v.errors.join("; "));
+  });
+
+  // ── 29. Persistence round-trip: multi-fragment → reload ──────────────────────────────
+  it("multi-fragment DB reloads all fragments correctly after reinit", () => {
+    const DB = makeDB(mock);
+    const cap = SHARD_DB.MAX_ENTRIES_COUNT;
+    for (let i = 1; i <= cap + 3; i++) {
+      DB.addToDB({ key: "u" + i, id: i, n: i }, { dbMain: "USERS" });
+    }
+    DB.saveToDBFiles();
+
+    const DB2 = SHARD_DB.init(INDEX_ID, mock.adapter);
+    assert.equal(DB2.lookUpById(1, { dbMain: "USERS" }).n, 1, "first fragment row accessible");
+    assert.equal(DB2.lookUpById(cap + 1, { dbMain: "USERS" }).n, cap + 1, "second fragment row accessible");
+    assert.equal(DB2.lookUpByKey("u" + (cap + 3), { dbMain: "USERS" }).n, cap + 3, "last row accessible by key");
+    const v = DB2.validateRoutingConsistency({ dbMain: "USERS" });
+    assert.equal(v.ok, true, v.errors.join("; "));
+  });
+
+  // ── 30. Persistence round-trip: dirty-skip — pure in-place update skips INDEX write ──
+  it("pure in-place update (same id+key) does not rewrite the master INDEX", () => {
+    const wrapped = wrapAdapterWithWriteCounts(mock.adapter, { indexFileId: INDEX_ID });
+    const DB = SHARD_DB.init(INDEX_ID, wrapped.adapter);
+    DB.addToDB({ key: "a", id: 1, v: 1 }, { dbMain: "USERS" });
+    DB.saveToDBFiles(); // first save — writes fragment + INDEX
+    wrapped.reset();
+
+    // Pure in-place update: same id, same key — indexRoutingDirty should remain false
+    DB.addToDB({ key: "a", id: 1, v: 2 }, { dbMain: "USERS" });
+    DB.saveToDBFiles();
+
+    const c = wrapped.counts();
+    assert.equal(c.indexWriteCount, 0, "INDEX must NOT be rewritten for a pure in-place update");
+    assert.equal(c.fragmentWriteCount, 1, "fragment must still be flushed");
+  });
+
+  // ── 31. Double-flush no-op ────────────────────────────────────────────────────────────
+  it("calling saveToDBFiles twice with no mutation between calls does zero writes on the second call", () => {
+    const DB = makeDB(mock);
+    DB.addToDB({ key: "a", id: 1, v: 1 }, { dbMain: "USERS" });
+    DB.saveToDBFiles(); // first save
+
+    // Wrap AFTER first save so we only count the second call
+    const wrapped = wrapAdapterWithWriteCounts(mock.adapter, { indexFileId: INDEX_ID });
+    const DB2 = SHARD_DB.init(INDEX_ID, wrapped.adapter);
+    DB2.addToDB({ key: "b", id: 2, v: 2 }, { dbMain: "USERS" });
+    DB2.saveToDBFiles(); // first flush — writes
+    wrapped.reset();
+
+    DB2.saveToDBFiles(); // second flush — nothing changed
+    const c = wrapped.counts();
+    assert.equal(c.writeCount, 0, "second saveToDBFiles must perform zero writes");
+  });
+
+  // ── 32. maxEntriesCount option ────────────────────────────────────────────────────────
+  it("init with maxEntriesCount=5 rolls to a new fragment after 5 rows", () => {
+    const DB = SHARD_DB.init(INDEX_ID, mock.adapter, { maxEntriesCount: 5 });
+    assert.equal(DB.maxEntriesCount, 5, "instance should expose maxEntriesCount");
+    for (let i = 1; i <= 6; i++) {
+      DB.addToDB({ key: "k" + i, id: i, n: i }, { dbMain: "USERS" });
+    }
+    assert.equal(DB.INDEX.USERS.properties.fragmentsList.length, 2,
+      "should have created a second fragment after 5 rows");
+    assert.equal(DB.lookUpById(6, { dbMain: "USERS" }).n, 6);
     const v = DB.validateRoutingConsistency({ dbMain: "USERS" });
     assert.equal(v.ok, true, v.errors.join("; "));
   });

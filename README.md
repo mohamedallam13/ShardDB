@@ -1,177 +1,171 @@
+<div align="center">
+
 # ShardDB
 
-A sharded, NoSQL document database that runs entirely on **Google Drive** — no external services, no billing, no infrastructure.
+**A real database for Google Apps Script — built on Drive, zero dependencies.**
 
-ShardDB splits your data across multiple Drive JSON files ("fragments") and maintains a master routing index so every lookup is fast regardless of how large your dataset grows. It is designed for Google Apps Script projects that need real persistence, real querying, and real scale — without leaving the Google ecosystem.
+ShardDB splits your data across sharded Drive files and routes every read in O(1).  
+No GCP project. No billing. No external services. Just your Drive.
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Tests](https://img.shields.io/badge/tests-68%20passing-brightgreen)](#testing)
+[![Platform](https://img.shields.io/badge/platform-Google%20Apps%20Script-yellow)](https://developers.google.com/apps-script)
+
+</div>
 
 ---
 
-## Why this exists
+## The problem
 
-Google Apps Script has no built-in database. The common workarounds all break down at scale:
+Google Apps Script has no built-in database. Every workaround hits a wall:
 
-| Approach | Breaks at |
+| What people do | Where it breaks |
 |---|---|
-| One big JSON file on Drive | ~5 MB — Drive read/write slows to a crawl |
-| PropertiesService | 500 KB total, 9 KB per value |
-| SpreadsheetApp as a DB | Slow, fragile, wrong tool |
-| Firestore / external DB | Requires GCP project, billing, OAuth complexity |
+| One big JSON file on Drive | ~5 MB — reads and writes crawl |
+| `PropertiesService` | 500 KB total storage cap |
+| Google Sheets as a DB | Slow, rate-limited, wrong abstraction |
+| Firestore | GCP project + billing + OAuth setup |
 
-ShardDB gives you a real database on infrastructure you already have.
+ShardDB solves this by turning Drive itself into a sharded document store — infrastructure you already have, already pay for, already have access to.
 
 ---
 
 ## How it works
 
-Your data is split across **fragment files** on Drive. A single **master INDEX file** holds the routing maps — so ShardDB always knows exactly which fragment holds any given row, without scanning every file.
+Your data is split across **fragment files**. A single **master INDEX** holds all routing — so ShardDB knows exactly which fragment holds any row without scanning every file.
 
 ```
-Google Drive
+Google Drive/
+├── MASTER_INDEX.json          ← read once on init; never grows unbounded
+│     keyToFragment: { alice → USERS_1, bob → USERS_2 }
+│     idRangesSorted: [{ fragment: USERS_1, min: 1, max: 1000 }, ...]
 │
-├── MASTER_INDEX.json          ← read once on init; holds all routing
-│     keyToFragment: { "alice" → "USERS_1", "bob" → "USERS_2" }
-│     idRangesSorted: [{ fragment: "USERS_1", min: 1, max: 1000 }, ...]
+├── USERS_1.json               ← shard: up to 1,000 rows
+│     index: { alice → 1, dave → 2 }
+│     data:  { 1: { id:1, key:"alice", ... } }
 │
-├── USERS_1.json               ← fragment: up to 1000 rows
-│     index: { "alice" → 1, "dave" → 2 }
-│     data:  { 1 → { id:1, key:"alice", ... }, 2 → { ... } }
-│
-├── USERS_2.json               ← next fragment, same structure
-└── ...
+└── USERS_2.json               ← next shard, same structure
 ```
 
-Fragments are loaded **lazily** — only the fragment containing the row you need is read from Drive. Everything else stays on disk.
+Fragments load **lazily** — only the shard containing the row you need is ever read from Drive. Everything else stays on disk.
 
 ---
 
-## Performance (measured on real Google Drive)
+## Performance
 
-These are real numbers from the GAS execution environment, not a mock:
+Real numbers. Real Drive. Real GAS execution environment.
 
-| Dataset | Shards | Save (initial) | Reload (init) | Read all rows | Nominal write (per shard) | Nominal delete (per shard) |
-|---|---|---|---|---|---|---|
-| 100 rows | 1 | 3.2 s | 363 ms | 427 ms | < 1 ms | < 1 ms |
-| 1 000 rows | 1 | 4.2 s | 326 ms | 409 ms | < 1 ms | < 1 ms |
-| 10 000 rows | 10 | 17.7 s | 342 ms | 3.8 s | < 1 ms | 2–4 ms |
-| 50 000 rows | 50 | 80.2 s | 745 ms | 19.8 s | < 2 ms | 9–14 ms |
-| 100 000 rows | 100 | 159 s | 858 ms | 37.8 s | 1 ms | 32–38 ms |
+| Dataset | Shards | Init (reload) | Lookup by key | Lookup by id | Write / delete per shard |
+|---|---|---|---|---|---|
+| 100 rows | 1 | **363 ms** | O(1) | O(log 1) | < 1 ms |
+| 1 000 rows | 1 | **326 ms** | O(1) | O(log 1) | < 1 ms |
+| 10 000 rows | 10 | **342 ms** | O(1) | O(log 10) | < 1 ms |
+| 50 000 rows | 50 | **745 ms** | O(1) | O(log 50) | < 2 ms |
+| 100 000 rows | 100 | **858 ms** | O(1) | O(log 100) | 1 ms |
 
-**Key insight:** The bottleneck is always Drive I/O (one network call per fragment file), not ShardDB's routing logic. Individual reads and writes in memory are sub-millisecond at every scale. Reload is fast because only the INDEX file is read on `init()` — fragments load lazily.
+**The bottleneck is always Drive I/O — not ShardDB.** Routing logic is in-memory and sub-millisecond at every scale. Init is fast because only the INDEX file is read — shards open lazily on first access.
 
 ### Complexity
 
-| Operation | Cost |
-|---|---|
-| `lookUpByKey` | O(1) — hash map lookup |
-| `lookUpById` | O(log F) — binary search, F = fragment count |
-| `addToDB` in-place update | O(1) — no INDEX rewrite |
-| `addToDB` new row | O(log F) |
-| `deleteFromDB` | O(1) |
-| `lookupByCriteria` with id | O(log F) — single fragment |
-| `lookupByCriteria` without id | O(N) — full scan |
-| `saveToDBFiles` (routing unchanged) | O(dirty fragments) — INDEX skipped |
-| `saveToDBFiles` (routing changed) | O(dirty fragments + 1) |
+| Operation | Cost | Notes |
+|---|---|---|
+| `lookUpByKey` | **O(1)** | Hash map — no Drive read if shard is cached |
+| `lookUpById` | **O(log F)** | Binary search on F fragment ranges |
+| `addToDB` update in-place | **O(1)** | Same id + same key — no INDEX rewrite |
+| `addToDB` new row | O(log F) | Range check + possible shard rollover |
+| `deleteFromDB` | **O(1)** | Direct eviction via routing maps |
+| `saveToDBFiles` routing unchanged | O(dirty shards) | INDEX write skipped entirely |
+| `saveToDBFiles` routing changed | O(dirty shards + 1) | +1 for INDEX write |
 
 ---
 
 ## Quick start
 
-### 1. Add the files to your Apps Script project
+### 1. Add to your project
 
-Copy these two files into your project:
-- `src/ShardDB/ShardDB.js`
-- `src/ShardDB/ShardDBToolkitHelpers.js`
+Copy into your Apps Script project:
 
-Or add via [clasp](https://github.com/google/clasp).
-
-### 2. Create an index file on Drive
-
-```javascript
-const folderId = "your-drive-folder-id";
-const folder = DriveApp.getFolderById(folderId);
-
-const initialIndex = {
-  USERS: {
-    properties: {
-      cumulative: true,
-      rootFolder: folderId,
-      filesPrefix: "usr",
-      fragmentsList: [],
-      keyToFragment: {},
-      idRangesSorted: []
-    },
-    dbFragments: {}
-  }
-};
-
-const indexFile = folder.createFile(
-  "MASTER_INDEX.json",
-  JSON.stringify(initialIndex),
-  "application/json"
-);
-
-Logger.log(indexFile.getId()); // save this ID
+```
+src/ShardDB/ShardDB.js
+src/ShardDB/ShardDBToolkitHelpers.js
 ```
 
-### 3. Initialize and use
+Or use [clasp](https://github.com/google/clasp) to push from this repo directly.
+
+### 2. Create the index file (one time)
+
+```javascript
+function setupShardDB() {
+  const folderId = "your-drive-folder-id";
+  const folder = DriveApp.getFolderById(folderId);
+
+  const index = {
+    USERS: {
+      properties: {
+        cumulative: true,
+        rootFolder: folderId,
+        filesPrefix: "usr",
+        fragmentsList: [],
+        keyToFragment: {},
+        idRangesSorted: []
+      },
+      dbFragments: {}
+    }
+  };
+
+  const file = folder.createFile("MASTER_INDEX.json", JSON.stringify(index), "application/json");
+  Logger.log("Index file ID: " + file.getId()); // store this
+}
+```
+
+### 3. Use it
 
 ```javascript
 const adapter = SHARD_DB_TOOLKIT.createDriveToolkitAdapter();
 const db = SHARD_DB.init("your-index-file-id", adapter);
+const ctx = { dbMain: "USERS" };
 
-// Add a row
-db.addToDB(
-  { key: "alice", id: 1, email: "alice@example.com", role: "admin" },
-  { dbMain: "USERS" }
-);
-
-// Save to Drive
+// Write
+db.addToDB({ key: "alice", id: 1, email: "alice@example.com", role: "admin" }, ctx);
 db.saveToDBFiles();
 
-// Look up by key — O(1)
-const user = db.lookUpByKey("alice", { dbMain: "USERS" });
+// Read — O(1)
+const user = db.lookUpByKey("alice", ctx);
+const same = db.lookUpById(1, ctx);
 
-// Look up by id — O(log F)
-const user2 = db.lookUpById(1, { dbMain: "USERS" });
+// Query
+const admins = db.lookupByCriteria([{ param: "role", criterion: "admin" }], ctx);
 
-// Query by field
-const admins = db.lookupByCriteria(
-  [{ param: "role", criterion: "admin" }],
-  { dbMain: "USERS" }
-);
+// Nested + array queries
+const results = db.lookupByCriteria([
+  { path: ["profile"], param: "status", criterion: "Active" },
+  { path: ["profile", "tags"], param: "clearance", criterion: "L2" }
+], ctx);
 
-// Query nested fields
-const activeL2 = db.lookupByCriteria(
-  [
-    { path: ["profile"], param: "status", criterion: "Active" },
-    { path: ["profile", "metrics"], param: "clearance", criterion: "L2" }
-  ],
-  { dbMain: "USERS" }
-);
+// Update — same id, same key: zero INDEX write overhead
+db.addToDB({ key: "alice", id: 1, email: "new@example.com", role: "admin" }, ctx);
+db.saveToDBFiles();
 
 // Delete
-db.deleteFromDBByKey("alice", { dbMain: "USERS" });
-db.deleteFromDBById(1, { dbMain: "USERS" });
-
-// Save changes
+db.deleteFromDBByKey("alice", ctx);
 db.saveToDBFiles();
 ```
 
 ---
 
-## API reference
+## API
 
-### Initialization
+### Init
 
 ```javascript
-const db = SHARD_DB.init(indexFileId, adapter, options);
+const db = SHARD_DB.init(indexFileId, adapter, options?);
 ```
 
-| Parameter | Type | Description |
+| Param | Type | Description |
 |---|---|---|
-| `indexFileId` | string | Drive file ID of the master INDEX JSON |
-| `adapter` | object | ToolkitAdapter — see Adapters section |
-| `options.maxEntriesCount` | number | Rows per fragment (default: 1000) |
+| `indexFileId` | `string` | Drive file ID of the master INDEX |
+| `adapter` | `object` | I/O adapter — see [Adapters](#adapters) |
+| `options.maxEntriesCount` | `number` | Rows per shard (default: `1000`) |
 
 Returns `null` if `indexFileId` is falsy.
 
@@ -179,136 +173,133 @@ Returns `null` if `indexFileId` is falsy.
 
 ### Write
 
-#### `addToDB(entry, ctx)`
-Insert or update a row. If a row with the same `id` already exists, it is updated in place. If the `key` changed, the old key is evicted from routing automatically.
+#### `db.addToDB(entry, ctx)`
+
+Insert or update. If a row with the same `id` exists it is updated in place. If the `key` changed, the old key is evicted from all routing maps automatically.
 
 ```javascript
-db.addToDB({ key: "alice", id: 1, ...payload }, { dbMain: "USERS" });
+db.addToDB({ key: "alice", id: 1, role: "admin" }, { dbMain: "USERS" });
 ```
 
-#### `saveToDBFiles()`
-Flush all dirty fragments to Drive. Writes the master INDEX only if routing metadata changed (new rows, deletes, key changes). Pure in-place value updates skip the INDEX write.
+#### `db.saveToDBFiles()`
 
-#### `saveIndex()`
-Force-write the master INDEX regardless of dirty state.
+Flush all dirty shards to Drive. Skips the INDEX write entirely if no routing metadata changed — pure value updates are free at the routing layer.
+
+#### `db.saveIndex()`
+
+Force-write the INDEX regardless of dirty state.
 
 ---
 
 ### Read
 
-#### `lookUpById(id, ctx)` → row | null
-#### `lookUpByKey(key, ctx)` → row | null
+#### `db.lookUpByKey(key, ctx)` → `row | null`
+#### `db.lookUpById(id, ctx)` → `row | null`
 
-#### `lookupByCriteria(criteria, ctx)` → row[]
-
-Each criterion is `{ param, criterion }` or `{ path, param, criterion }`:
+#### `db.lookupByCriteria(criteria, ctx)` → `row[]`
 
 ```javascript
-// simple field
+// Exact match
 { param: "status", criterion: "active" }
 
-// nested object
+// Nested object
 { path: ["profile"], param: "status", criterion: "active" }
 
-// array of objects — scans all elements
+// Array of objects — all elements are scanned
 { path: ["profile", "tags"], param: "label", criterion: "admin" }
 
-// function criterion
-{ param: "score", criterion: (v) => v > 90 }
+// Function predicate
+{ param: "score", criterion: v => v > 90 }
 ```
 
-`id` criterion uses the O(log F) fast path — only one fragment is opened.
+Providing an `id` criterion uses the O(log F) fast path — only one shard is opened.
 
 ---
 
 ### Delete
 
-#### `deleteFromDBById(id, ctx)`
-#### `deleteFromDBByKey(key, ctx)`
+#### `db.deleteFromDBById(id, ctx)`
+#### `db.deleteFromDBByKey(key, ctx)`
 
-Both remove the row from the fragment and clean up all routing maps. Call `saveToDBFiles()` afterward to persist.
+Removes the row and evicts it from all routing maps. Call `saveToDBFiles()` to persist.
 
 ---
 
 ### Lifecycle
 
-#### `closeDB(ctx)` 
-Evicts fragment(s) from memory. Next access re-reads from Drive. Useful for long-running scripts to control RAM.
-
-#### `clearDB(ctx)`
-Wipes all rows from a table (or single fragment) and resets routing. Keeps the fragment files on Drive.
-
-#### `destroyDB(ctx)`
-Deletes fragment files from Drive and removes the table from the INDEX. Irreversible.
+| Method | What it does |
+|---|---|
+| `db.closeDB(ctx)` | Evict shard(s) from memory. Next access re-reads from Drive. |
+| `db.clearDB(ctx)` | Wipe all rows and reset routing. Files stay on Drive. |
+| `db.destroyDB(ctx?)` | Delete shard files from Drive. Irreversible. |
 
 ---
 
 ### Utilities
 
-#### `getIndexFootprint(ctx)` → `{ indexJsonBytes, keyToFragmentCount, fragmentsCount, ... }`
-Returns the size of the master INDEX for a given table — useful for monitoring index growth.
+#### `db.getIndexFootprint(ctx?)` → `{ indexJsonBytes, keyToFragmentCount, fragmentsCount, ... }`
 
-#### `validateRoutingConsistency(ctx)` → `{ ok, errors[] }`
-Checks that `keyToFragment`, `idRangesSorted`, and fragment data are all consistent with each other. Use this in tests and health checks.
+Monitor INDEX growth over time. `keyToFragment` grows ~21 bytes per key — at 100k rows that's ~2.1 MB.
 
-#### `addExternalConfig(key, value, ctx)` / `getExternalConfig(key, ctx)`
-Store arbitrary metadata on a fragment (e.g. schema version, timestamps).
+#### `db.validateRoutingConsistency(ctx)` → `{ ok, errors[] }`
+
+Full consistency check across `keyToFragment`, `idRangesSorted`, and fragment data. Use in health checks and tests.
+
+#### `db.addExternalConfig(key, value, ctx)` / `db.getExternalConfig(key, ctx)`
+
+Attach arbitrary metadata to a shard — schema version, sync timestamps, feature flags.
 
 ---
 
 ## Multiple tables
 
-One INDEX file can hold multiple tables. Each table is a top-level key in the INDEX:
+One INDEX file holds any number of tables. Tables are fully isolated — separate shards, separate routing.
 
 ```javascript
-const initialIndex = {
+const index = {
   USERS:  { properties: { ..., filesPrefix: "usr" }, dbFragments: {} },
   ORDERS: { properties: { ..., filesPrefix: "ord" }, dbFragments: {} }
 };
 
-db.addToDB({ key: "u1", id: 1, name: "Alice" }, { dbMain: "USERS" });
-db.addToDB({ key: "o1", id: 1, total: 49.99 },  { dbMain: "ORDERS" });
+db.addToDB({ key: "u1", id: 1, name: "Alice" },  { dbMain: "USERS" });
+db.addToDB({ key: "o1", id: 1, total: 49.99 },   { dbMain: "ORDERS" });
 ```
-
-Tables are fully isolated — separate fragments, separate routing, no cross-contamination.
 
 ---
 
 ## Adapters
 
-ShardDB is decoupled from Drive via an adapter interface. You provide the I/O layer; ShardDB handles the rest.
+ShardDB is fully decoupled from Drive. You supply the I/O layer — ShardDB handles everything else.
 
-### Built-in: DriveToolkitAdapter
+### DriveApp adapter (built-in)
 
 ```javascript
 const adapter = SHARD_DB_TOOLKIT.createDriveToolkitAdapter();
-const db = SHARD_DB.init(indexFileId, adapter);
 ```
 
-Uses `DriveApp` directly — no extra OAuth scopes beyond Drive.
+Uses `DriveApp` directly. No extra scopes beyond `drive`.
 
-### Built-in: Backup/Restore wrapper
+### Backup/restore wrapper (built-in)
 
-Wraps any adapter. Every write is mirrored to a `.backup.json` file alongside the primary. On read failure, falls back to the backup automatically.
+Mirrors every write to a `.backup.json` file. Falls back to the backup automatically on read failure.
 
 ```javascript
 const adapter = SHARD_DB_TOOLKIT.wrapWithBackupRestore(
   SHARD_DB_TOOLKIT.createDriveToolkitAdapter(),
   { enabled: true }
 );
-const db = SHARD_DB.init(indexFileId, adapter);
 ```
 
 ### Custom adapter
 
-Implement four methods to use any storage backend:
+Plug in any storage backend by implementing four methods:
 
 ```javascript
 const adapter = {
-  readFromJSON:  (fileId) => { /* return parsed object or null */ },
-  writeToJSON:   (fileId, payload) => { /* write JSON */ },
-  createJSON:    (name, folderId, payload) => { /* return new fileId */ },
-  deleteFile:    (fileId) => { /* delete or trash */ }
+  readFromJSON:  (fileId)              => parsedObject | null,
+  writeToJSON:   (fileId, payload)     => void,
+  createJSON:    (name, folderId, obj) => newFileId,
+  deleteFile:    (fileId)              => void
 };
 ```
 
@@ -316,30 +307,27 @@ const adapter = {
 
 ## Tuning shard size
 
-The default is 1000 rows per fragment. You can override it per instance:
-
 ```javascript
 const db = SHARD_DB.init(indexFileId, adapter, { maxEntriesCount: 5000 });
 ```
 
-**Larger shards** → fewer Drive API calls per save → faster saves.  
-**Smaller shards** → each file is smaller → faster individual reads.
-
-The Drive API call overhead (~300–600ms per file) dominates at all realistic sizes. If your workload writes many rows per session before saving, prefer larger shards. If your workload is read-heavy with lazy loads, smaller shards reduce the data parsed per access.
+The default is `1000` rows per shard. The Drive API call cost (~300–600 ms per file) dominates at all sizes — so larger shards mean fewer calls per save, which is almost always better. Tune based on your write pattern: if you write many rows per session before saving, go larger.
 
 ---
 
-## Node.js test suite
+## Testing
 
-The library ships with a full test suite that runs in Node using a mock Drive adapter — no Google account needed.
+Ships with a full test suite. No Google account needed for Node tests.
 
 ```bash
 npm install
-npm test           # 68 correctness tests
-npm run test:heavy # 10k-row comprehensive test
-npm run test:perf-matrix        # throughput benchmark (1k / 5k / 10k rows)
-npm run test:perf-matrix:full   # + 50k and 100k
+npm test                          # 68 correctness tests
+npm run test:heavy                # 10k-row end-to-end
+npm run test:perf-matrix          # throughput at 1k / 5k / 10k
+npm run test:perf-matrix:full     # + 50k and 100k
 ```
+
+For GAS (real Drive): open the Apps Script editor and run `runShardDbAssertionSuite`. It covers correctness across all bug-fix cases and the full nominal-ops performance matrix at all 5 scales.
 
 ---
 
@@ -348,25 +336,22 @@ npm run test:perf-matrix:full   # + 50k and 100k
 ```
 src/
   ShardDB/
-    ShardDB.js                  ← core library (UMD, no dependencies)
-    ShardDBToolkitHelpers.js    ← DriveApp adapter + backup wrapper
+    ShardDB.js                ← core engine — zero dependencies
+    ShardDBToolkitHelpers.js  ← DriveApp adapter + backup wrapper
   tests/
-    ShardDB-TestSuite.js        ← GAS test suite (run in Apps Script editor)
+    ShardDB-TestSuite.js      ← GAS test suite
   appsscript.json
 
-tests/                          ← Node.js test suite
+tests/                        ← Node test suite
   sharddb.test.js
   sharddb-correctness-gaps.test.js
   sharddb-operation-coverage.test.js
   sharddb-extended.test.js
   sharddb-10k-comprehensive.test.js
   helpers/
-    mock-drive.js
-    load-sharddb.js
-    bootstrap-gas-fakes.js
 
 docs/
-  ARCHITECTURE.md               ← full architecture with Mermaid diagrams
+  ARCHITECTURE.md             ← full architecture + Mermaid diagrams
 ```
 
 ---

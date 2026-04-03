@@ -36,6 +36,48 @@
 
   const MAX_ENTRIES_COUNT = 1000;
 
+  /**
+   * Build a composite OPEN_DB key from dbMain and fragment name.
+   * Prevents silent collision when two dbMains share the same fragment suffix (e.g. both named "_1").
+   */
+  function openDbKey(dbMain, dbFragment) {
+    return dbMain + "\x00" + dbFragment;
+  }
+
+  /**
+   * Partition routing helpers.
+   *
+   * When a dbMain is configured with a `partitionBy` function the fragment name
+   * is derived deterministically from the partition key:
+   *
+   *   base fragment  →  `${dbMain}_p_${sanitizedPartitionKey}`
+   *   overflow #2    →  `${dbMain}_p_${sanitizedPartitionKey}_2`
+   *   overflow #3    →  `${dbMain}_p_${sanitizedPartitionKey}_3`  … etc.
+   *
+   * This lets the caller derive the exact fragment name from the partition key
+   * alone — no INDEX lookup needed for the common (single-shard) case.
+   */
+  function sanitizePartitionKey(pk) {
+    // Allow letters, digits, dash, dot, @. Replace everything else with "_".
+    return String(pk).replace(/[^A-Za-z0-9\-\.@]/g, "_");
+  }
+
+  function partitionBaseFragment(dbMain, partitionKey) {
+    return dbMain + "_p_" + sanitizePartitionKey(partitionKey);
+  }
+
+  /**
+   * Given a base partition fragment name, return the next overflow name.
+   * Base → Base_2 → Base_3 …  (same counter logic as createNewCumulativeFragment)
+   */
+  function nextPartitionFragment(baseFragment, lastFragment) {
+    if (!lastFragment || lastFragment === baseFragment) return baseFragment + "_2";
+    const countingRegex = /_(\d+)$/;
+    const match = lastFragment.match(countingRegex);
+    if (!match) return lastFragment + "_2";
+    return lastFragment.replace(/_\d+$/, "_" + (parseInt(match[1], 10) + 1));
+  }
+
   class OpenDBEntry {
     constructor(dbMain, fragmentFileObj) {
       this.properties = { isChanged: false, main: dbMain };
@@ -69,11 +111,24 @@
     return String(key);
   }
 
-  function init(indexFileId, ToolkitAdapter) {
+  function init(indexFileId, ToolkitAdapter, options) {
     if (!indexFileId) return null;
     if (!ToolkitAdapter || typeof ToolkitAdapter.readFromJSON !== "function") {
       throw new Error("JSONDatabase requires ToolkitAdapter to execute Drive I/O.");
     }
+    options = options || {};
+    var instanceMaxEntries =
+      options.maxEntriesCount != null && Number.isFinite(Number(options.maxEntriesCount))
+        ? Number(options.maxEntriesCount)
+        : MAX_ENTRIES_COUNT;
+
+    /**
+     * Per-dbMain partition functions supplied at init time.
+     * Key: dbMain string.  Value: function(entry) → partitionKey string.
+     * These are NOT persisted to the INDEX (functions can't be serialized).
+     * The caller must pass the same `partitionBy` map on every init() call.
+     */
+    var PARTITION_FNS = options.partitionBy || {};
 
     function initiateDB() {
       return ToolkitAdapter.readFromJSON(indexFileId);
@@ -184,6 +239,90 @@
       });
     }
 
+    /**
+     * Returns true when dbMain uses partition routing (caller supplied a partitionBy fn).
+     */
+    function isPartitioned(dbMain) {
+      return typeof PARTITION_FNS[dbMain] === "function";
+    }
+
+    /**
+     * Derive the base partition fragment name for `entry` under `dbMain`.
+     * Throws if `dbMain` has no partitionBy function registered.
+     */
+    function partitionFragmentForEntry(dbMain, entry) {
+      var pk = PARTITION_FNS[dbMain](entry);
+      return partitionBaseFragment(dbMain, pk);
+    }
+
+    /**
+     * Derive the base partition fragment name directly from a partition key string.
+     */
+    function partitionFragmentForKey(dbMain, partitionKey) {
+      return partitionBaseFragment(dbMain, partitionKey);
+    }
+
+    /**
+     * For a given partition base fragment, find the overflow shard that still has
+     * room for a new entry (not in data), or create a new overflow shard.
+     * Returns the target fragment name (opens it in OPEN_DB if needed).
+     */
+    function resolvePartitionFragment(dbMain, baseFragment, entryId) {
+      const { dbFragments, properties } = INDEX[dbMain];
+      const { fragmentsList } = properties;
+
+      // Collect all fragments that belong to this partition (base + overflows).
+      var siblings = fragmentsList.filter(function (f) {
+        return f === baseFragment || f.indexOf(baseFragment + "_") === 0;
+      });
+
+      if (siblings.length === 0) {
+        // First entry for this partition — create base fragment.
+        addInIndexFile(dbMain, baseFragment);
+        openDBFragment(dbMain, baseFragment);
+        return baseFragment;
+      }
+
+      // Walk siblings in order: base first, then _2, _3 …
+      siblings.sort(function (a, b) {
+        if (a === baseFragment) return -1;
+        if (b === baseFragment) return 1;
+        var na = parseInt((a.match(/_(\d+)$/) || [0, 0])[1], 10);
+        var nb = parseInt((b.match(/_(\d+)$/) || [0, 0])[1], 10);
+        return na - nb;
+      });
+
+      // If entryId already lives in one of the siblings, route there (in-place update).
+      // NOTE: We scan siblings directly rather than using findFragmentForId because
+      // partition ranges overlap across different partitions — the binary search is
+      // only valid within a single partition's sibling set, not across the whole table.
+      if (entryId != null) {
+        var nid = normalizeId(entryId);
+        for (var si = 0; si < siblings.length; si++) {
+          var sib = siblings[si];
+          openDBFragment(dbMain, sib);
+          var sibOpen = OPEN_DB[openDbKey(dbMain, sib)];
+          if (sibOpen && sibOpen.toWrite.data[nid] != null) {
+            return sib;
+          }
+        }
+      }
+
+      // Find last sibling with room.
+      var lastSibling = siblings[siblings.length - 1];
+      openDBFragment(dbMain, lastSibling);
+      var open = OPEN_DB[openDbKey(dbMain, lastSibling)];
+      if (open && Object.keys(open.toWrite.data).length < instanceMaxEntries) {
+        return lastSibling;
+      }
+
+      // All siblings full — create next overflow.
+      var newFrag = nextPartitionFragment(baseFragment, lastSibling);
+      addInIndexFile(dbMain, newFrag);
+      openDBFragment(dbMain, newFrag);
+      return newFrag;
+    }
+
     function removeKeysFromRouting(dbMain, keys) {
       ensureDbMainRouting(dbMain);
       const kf = INDEX[dbMain].properties.keyToFragment;
@@ -203,7 +342,7 @@
     }
 
     function recalcFragmentIdRangeAfterMutation(dbMain, dbFragment) {
-      const open = OPEN_DB[dbFragment];
+      const open = OPEN_DB[openDbKey(dbMain, dbFragment)];
       if (!open) {
         rebuildIdRangeSorted(dbMain);
         return;
@@ -240,16 +379,17 @@
 
     function closeDB({ dbMain, dbFragment }) {
       if (!dbFragment) closeDBMain(dbMain);
-      else closeFragment(dbFragment);
+      else closeFragment(dbMain, dbFragment);
     }
 
     function closeDBMain(dbMain) {
       const { fragmentsList } = INDEX[dbMain].properties;
-      fragmentsList.forEach(closeFragment);
+      fragmentsList.forEach(function (frag) { closeFragment(dbMain, frag); });
     }
 
-    function closeFragment(dbFragment) {
-      if (OPEN_DB[dbFragment]) delete OPEN_DB[dbFragment];
+    function closeFragment(dbMain, dbFragment) {
+      var k = openDbKey(dbMain, dbFragment);
+      if (OPEN_DB[k]) delete OPEN_DB[k];
     }
 
     function clearDB({ dbMain, dbFragment }) {
@@ -273,9 +413,10 @@
       purgeRoutingKeysForFragment(dbMain, dbFragment);
       rebuildIdRangeSorted(dbMain);
       markIndexRoutingDirty(dbMain);
-      if (OPEN_DB[dbFragment]) {
-        OPEN_DB[dbFragment].toWrite = { index: {}, data: {} };
-        OPEN_DB[dbFragment].properties.isChanged = false;
+      var k = openDbKey(dbMain, dbFragment);
+      if (OPEN_DB[k]) {
+        OPEN_DB[k].toWrite = { index: {}, data: {} };
+        OPEN_DB[k].properties.isChanged = false;
       }
     }
 
@@ -308,7 +449,8 @@
       purgeRoutingKeysForFragment(dbMain, dbFragment);
       delete INDEX[dbMain].dbFragments[dbFragment];
       pull(dbFragment, fragmentsList);
-      if (OPEN_DB[dbFragment]) delete OPEN_DB[dbFragment];
+      var k = openDbKey(dbMain, dbFragment);
+      if (OPEN_DB[k]) delete OPEN_DB[k];
       rebuildIdRangeSorted(dbMain);
       markIndexRoutingDirty(dbMain);
     }
@@ -321,14 +463,15 @@
 
     function saveToDBFiles() {
       let wroteFragment = false;
-      Object.keys(OPEN_DB).forEach(function (dbFragment) {
-        const { properties, toWrite } = OPEN_DB[dbFragment];
-        const { isChanged, main } = properties;
+      Object.keys(OPEN_DB).forEach(function (compositeKey) {
+        const entry = OPEN_DB[compositeKey];
+        const { properties, toWrite } = entry;
+        const { isChanged, main, fragment } = properties;
         if (!isChanged) return;
         wroteFragment = true;
-        const { fileId } = INDEX[main].dbFragments[dbFragment];
+        const { fileId } = INDEX[main].dbFragments[fragment];
         if (fileId === "") {
-          createNewFile(main, dbFragment, toWrite);
+          createNewFile(main, fragment, toWrite);
         } else {
           ToolkitAdapter.writeToJSON(fileId, toWrite);
         }
@@ -342,7 +485,17 @@
     function createNewFile(dbMain, dbFragment, toWrite) {
       const { dbFragments, properties } = INDEX[dbMain];
       const { rootFolder, filesPrefix } = properties;
-      const newFileId = createDBFile(toWrite, rootFolder, filesPrefix, dbFragment);
+      var newFileId;
+      try {
+        newFileId = createDBFile(toWrite, rootFolder, filesPrefix, dbFragment);
+      } catch (e) {
+        // createJSON failed: do not store a phantom fileId — leave it as "" so
+        // the next saveToDBFiles call will retry. Re-mark as changed so the retry
+        // path triggers again.
+        var k = openDbKey(dbMain, dbFragment);
+        if (OPEN_DB[k]) OPEN_DB[k].properties.isChanged = true;
+        throw e;
+      }
       dbFragments[dbFragment].fileId = newFileId;
       markIndexRoutingDirty(dbMain);
     }
@@ -355,23 +508,28 @@
       const { properties } = INDEX[dbMain];
       const { cumulative } = properties;
       let targetFragment;
-      if (dbFragment) {
+
+      if (isPartitioned(dbMain)) {
+        // Partition routing: derive fragment from partitionBy(entry).
+        var basePartFrag = partitionFragmentForEntry(dbMain, entry);
+        targetFragment = resolvePartitionFragment(dbMain, basePartFrag, id);
+      } else if (dbFragment) {
         targetFragment = getProperFragment(dbMain, dbFragment);
       } else {
         const existingFrag = findFragmentForId(id, dbMain);
         if (existingFrag) {
           targetFragment = existingFrag;
-          if (!OPEN_DB[targetFragment]) openDBFragment(dbMain, targetFragment);
+          if (!OPEN_DB[openDbKey(dbMain, targetFragment)]) openDBFragment(dbMain, targetFragment);
         } else {
           targetFragment = getProperFragment(dbMain, null);
         }
       }
-      if (cumulative) targetFragment = checkOpenDBSize(dbMain, targetFragment, id);
+      if (!isPartitioned(dbMain) && cumulative) targetFragment = checkOpenDBSize(dbMain, targetFragment, id);
       if (!targetFragment) return;
 
       ensureDbMainRouting(dbMain);
       const { ignoreIndex } = INDEX[dbMain].dbFragments[targetFragment];
-      const tw = OPEN_DB[targetFragment].toWrite;
+      const tw = OPEN_DB[openDbKey(dbMain, targetFragment)].toWrite;
       const prior = tw.data[id];
 
       if (prior != null && normalizeKey(prior.key) !== key) {
@@ -403,14 +561,38 @@
         if (id > rmax) { range.max = id; rangeChanged = true; }
       }
       tw.data[id] = entryNorm;
-      OPEN_DB[targetFragment].properties.isChanged = true;
+      OPEN_DB[openDbKey(dbMain, targetFragment)].properties.isChanged = true;
       if (rangeChanged) rebuildIdRangeSorted(dbMain);
       if (indexRoutingDirty) markIndexRoutingDirty(dbMain);
     }
 
-    function lookupByCriteria(criteria = [], { dbMain, dbFragment }) {
-      if (dbMain && !dbFragment) return lookUpDBMainByCriteria(criteria, dbMain);
+    function lookupByCriteria(criteria = [], { dbMain, dbFragment, partitionKey }) {
+      if (dbMain && !dbFragment) {
+        if (partitionKey != null && isPartitioned(dbMain)) {
+          return lookUpPartitionByCriteria(criteria, dbMain, partitionKey);
+        }
+        return lookUpDBMainByCriteria(criteria, dbMain);
+      }
       return lookUpFragmentByCriteria(criteria, dbMain, dbFragment);
+    }
+
+    /**
+     * Scan only the fragments that belong to a single partition (base + overflows).
+     * Avoids touching fragments for other partitions entirely.
+     */
+    function lookUpPartitionByCriteria(criteria, dbMain, partitionKey) {
+      var baseFragment = partitionFragmentForKey(dbMain, partitionKey);
+      var { fragmentsList } = INDEX[dbMain].properties;
+      var siblings = fragmentsList.filter(function (f) {
+        return f === baseFragment || f.indexOf(baseFragment + "_") === 0;
+      });
+      var entries = [];
+      siblings.forEach(function (frag) {
+        var ok = openDBFragment(dbMain, frag);
+        if (!ok) return;
+        entries = entries.concat(lookUpFragmentByCriteria(criteria, dbMain, frag));
+      });
+      return entries;
     }
 
     function lookUpDBMainByCriteria(criteria, dbMain) {
@@ -418,6 +600,13 @@
       let entries = [];
       const idObj = getCriterionObjByParam(criteria, "id");
       if (idObj) {
+        if (criteria.length > 1) {
+          console.warn(
+            "ShardDB.lookupByCriteria: 'id' criterion short-circuits to a single row; " +
+            (criteria.length - 1) + " additional criterion/criteria are NOT applied. " +
+            "Remove 'id' from the criteria array if you need compound filtering."
+          );
+        }
         var nid = normalizeId(idObj.criterion);
         var dbFrag = findFragmentForId(nid, dbMain);
         if (!dbFrag) return [];
@@ -437,7 +626,7 @@
     function lookUpFragmentByCriteria(criteria, dbMain, dbFragment) {
       const fragmentExistCheck = openDBFragment(dbMain, dbFragment);
       if (!fragmentExistCheck) return [];
-      const { toWrite } = OPEN_DB[dbFragment];
+      const { toWrite } = OPEN_DB[openDbKey(dbMain, dbFragment)];
       const { data } = toWrite;
       let entries = Object.values(data);
       if (!criteria || criteria.length === 0) return entries;
@@ -453,6 +642,16 @@
       return entries.filter(function (entry) {
         const value = getValueFromPath(path, param, entry);
         if (value === undefined) return false;
+        // If the terminal node is an array (e.g. path led into an array and param
+        // names a field that multiple elements might have), check whether ANY element
+        // satisfies the criterion rather than requiring a single scalar match.
+        if (Array.isArray(value)) {
+          return value.some(function (el) {
+            if (el === undefined) return false;
+            if (typeof criterion === "function") return criterion(el);
+            return el === criterion;
+          });
+        }
         if (typeof criterion === "function") return criterion(value);
         return value === criterion;
       });
@@ -464,33 +663,125 @@
       });
     }
 
-    function getValueFromPath(path = [], param, entry) {
-      let value;
+    /**
+     * Traverse `path` from `entry`, then read `param`.
+     *
+     * When an intermediate or terminal node is an array, the function searches
+     * *every* element for one that contains the next key (or `param`), rather
+     * than blindly taking `[0]`. This fixes the silent correctness failure where
+     * matching values stored at index > 0 were never found.
+     *
+     * Rules:
+     *  - If a node is an object, descend directly.
+     *  - If a node is an array, find the first element that has the next key.
+     *  - If nothing is found at any level, return undefined.
+     */
+    function getValueFromPath(path, param, entry) {
       if (!path || path.length === 0) return entry[param];
-      path.forEach(function (pathParam, i) {
-        if (i === 0) {
-          value = entry[pathParam];
-        } else {
-          if (!value) return;
-          if (Array.isArray(value)) value = value[0];
-          value = value[pathParam];
+
+      /**
+       * Given a node that may be an object or array, return the child at `key`.
+       * When `node` is an array, scan all elements and return the value from the
+       * first element that owns `key`.
+       */
+      function descend(node, key) {
+        if (node == null) return undefined;
+        if (Array.isArray(node)) {
+          for (var i = 0; i < node.length; i++) {
+            var el = node[i];
+            if (el != null && typeof el === "object" && !Array.isArray(el) &&
+                Object.prototype.hasOwnProperty.call(el, key)) {
+              return el[key];
+            }
+          }
+          return undefined;
         }
-      });
-      if (value) {
-        if (Array.isArray(value)) value = value[0];
-        value = value[param];
+        return node[key];
       }
-      return value;
+
+      var node = entry;
+      for (var i = 0; i < path.length; i++) {
+        node = descend(node, path[i]);
+        if (node === undefined) return undefined;
+      }
+      // If the node at the end of the path is an array, collect param values from
+      // every element so the caller can check if ANY of them satisfies the criterion.
+      if (Array.isArray(node)) {
+        var collected = [];
+        for (var j = 0; j < node.length; j++) {
+          var el = node[j];
+          if (el != null && typeof el === "object" && !Array.isArray(el) &&
+              Object.prototype.hasOwnProperty.call(el, param)) {
+            collected.push(el[param]);
+          }
+        }
+        return collected.length > 0 ? collected : undefined;
+      }
+      return descend(node, param);
     }
 
-    function lookUpByKey(key, { dbMain, dbFragment }) {
-      if (dbMain && !dbFragment) return lookUpByKeyQueryArray(key, dbMain);
+    function lookUpByKey(key, { dbMain, dbFragment, partitionKey }) {
+      if (dbMain && !dbFragment) {
+        if (partitionKey != null && isPartitioned(dbMain)) {
+          return lookUpByKeyInPartition(key, dbMain, partitionKey);
+        }
+        return lookUpByKeyQueryArray(key, dbMain);
+      }
       return lookUpInFragmentByKey(key, dbMain, dbFragment);
     }
 
-    function lookUpById(id, { dbMain, dbFragment }) {
-      if (dbMain && !dbFragment) return lookUpByIdQueryArray(id, dbMain);
+    function lookUpById(id, { dbMain, dbFragment, partitionKey }) {
+      if (dbMain && !dbFragment) {
+        if (partitionKey != null && isPartitioned(dbMain)) {
+          return lookUpByIdInPartition(id, dbMain, partitionKey);
+        }
+        return lookUpByIdQueryArray(id, dbMain);
+      }
       return lookUpInFragmentById(id, dbMain, dbFragment);
+    }
+
+    /**
+     * Look up by key, scanning only the fragments for the given partition.
+     * When the partition has a single shard (common case) this is a direct hit
+     * with zero INDEX traversal.
+     */
+    function lookUpByKeyInPartition(key, dbMain, partitionKey) {
+      key = normalizeKey(key);
+      // Try the master routing map first (populated on every addToDB).
+      var fromRouting = findFragmentForKey(key, dbMain);
+      if (fromRouting) {
+        var baseFragment = partitionFragmentForKey(dbMain, partitionKey);
+        // Only use fromRouting if it actually belongs to this partition.
+        if (fromRouting === baseFragment || fromRouting.indexOf(baseFragment + "_") === 0) {
+          var ok = openDBFragment(dbMain, fromRouting);
+          if (ok) return lookUpInFragmentByKey(key, dbMain, fromRouting);
+        }
+      }
+      // Fallback: scan partition siblings.
+      var results = lookUpPartitionByCriteria([{ param: "key", criterion: key }], dbMain, partitionKey);
+      return results.length > 0 ? results[0] : null;
+    }
+
+    /**
+     * Look up by id, scanning only the fragments for the given partition.
+     * Does NOT use findFragmentForId (global binary search) because partition
+     * id-ranges overlap across different partitions — ranges are only disjoint
+     * within a single partition's sibling set.
+     */
+    function lookUpByIdInPartition(id, dbMain, partitionKey) {
+      id = normalizeId(id);
+      var baseFragment = partitionFragmentForKey(dbMain, partitionKey);
+      var { fragmentsList } = INDEX[dbMain].properties;
+      var siblings = fragmentsList.filter(function (f) {
+        return f === baseFragment || f.indexOf(baseFragment + "_") === 0;
+      });
+      for (var i = 0; i < siblings.length; i++) {
+        var ok = openDBFragment(dbMain, siblings[i]);
+        if (!ok) continue;
+        var row = lookUpInFragmentById(id, dbMain, siblings[i]);
+        if (row != null) return row;
+      }
+      return null;
     }
 
     function deleteFromDBByKey(key, { dbMain, dbFragment }) {
@@ -503,7 +794,7 @@
       if (!fragmentExistCheck) return;
       const id = resolveIdForKeyInFragment(key, dbMain, dbFragment);
       if (id == null) return;
-      deleteIdEntriesInFragment(id, dbFragment);
+      deleteIdEntriesInFragment(id, dbMain, dbFragment);
     }
 
     function deleteFromDBById(id, { dbMain, dbFragment }) {
@@ -514,12 +805,12 @@
       }
       const fragmentExistCheck = openDBFragment(dbMain, dbFragment);
       if (!fragmentExistCheck) return;
-      deleteIdEntriesInFragment(id, dbFragment);
+      deleteIdEntriesInFragment(id, dbMain, dbFragment);
     }
 
-    function deleteIdEntriesInFragment(id, dbFragment) {
-      const open = OPEN_DB[dbFragment];
-      const dbMain = open.properties.main;
+    function deleteIdEntriesInFragment(id, dbMain, dbFragment) {
+      const open = OPEN_DB[openDbKey(dbMain, dbFragment)];
+      // dbMain is passed explicitly; keep reading from properties for safety
       id = normalizeId(id);
       const prior = open.toWrite.data[id];
       if (prior && prior.key != null) {
@@ -556,7 +847,7 @@
       if (!INDEX[dbMain].dbFragments[dbFragment]) return null;
       const fragmentExistCheck = openDBFragment(dbMain, dbFragment);
       if (!fragmentExistCheck) return null;
-      const { toWrite } = OPEN_DB[dbFragment];
+      const { toWrite } = OPEN_DB[openDbKey(dbMain, dbFragment)];
       const id = resolveIdForKeyInFragment(key, dbMain, dbFragment);
       if (id == null) return null;
       return toWrite.data[id];
@@ -567,13 +858,15 @@
       if (!INDEX[dbMain].dbFragments[dbFragment]) return null;
       const fragmentExistCheck = openDBFragment(dbMain, dbFragment);
       if (!fragmentExistCheck) return null;
-      const { toWrite } = OPEN_DB[dbFragment];
-      return toWrite.data[id];
+      const { toWrite } = OPEN_DB[openDbKey(dbMain, dbFragment)];
+      // data[id] is undefined when the id was deleted but the fragment idRange still covers it
+      // (binary search correctly lands here; the row is simply absent)
+      return toWrite.data[id] != null ? toWrite.data[id] : null;
     }
 
     function lookUpForKeysInFragment(id, dbMain, dbFragment) {
       if (!INDEX[dbMain].dbFragments[dbFragment]) return null;
-      const { toWrite } = OPEN_DB[dbFragment];
+      const { toWrite } = OPEN_DB[openDbKey(dbMain, dbFragment)];
       const { index } = toWrite;
       id = normalizeId(id);
       return Object.keys(index)
@@ -588,7 +881,7 @@
     function lookUpForIdInFragment(key, dbMain, dbFragment) {
       key = normalizeKey(key);
       if (!INDEX[dbMain].dbFragments[dbFragment]) return null;
-      const { toWrite } = OPEN_DB[dbFragment];
+      const { toWrite } = OPEN_DB[openDbKey(dbMain, dbFragment)];
       return toWrite.index[key];
     }
 
@@ -597,7 +890,7 @@
       key = normalizeKey(key);
       var fromIdx = lookUpForIdInFragment(key, dbMain, dbFragment);
       if (fromIdx != null) return normalizeId(fromIdx);
-      const { toWrite } = OPEN_DB[dbFragment];
+      const { toWrite } = OPEN_DB[openDbKey(dbMain, dbFragment)];
       const d = toWrite.data;
       var keys = Object.keys(d);
       for (var i = 0; i < keys.length; i++) {
@@ -618,7 +911,7 @@
       }
       ensureDbMainRouting(dbMain);
       const targetFragment = checkInIndex(dbMain, dbFragment);
-      if (!OPEN_DB[targetFragment]) {
+      if (!OPEN_DB[openDbKey(dbMain, targetFragment)]) {
         openDBFragment(dbMain, targetFragment);
       }
       return targetFragment;
@@ -642,7 +935,8 @@
     }
 
     function openDBFragment(dbMain, dbFragment) {
-      if (OPEN_DB[dbFragment]) return true;
+      var k = openDbKey(dbMain, dbFragment);
+      if (OPEN_DB[k]) return true;
       if (!INDEX[dbMain].dbFragments[dbFragment]) return false;
       let fragmentFileObj;
       const { fileId } = INDEX[dbMain].dbFragments[dbFragment];
@@ -652,7 +946,9 @@
     }
 
     function addToOpenDBsObj(dbMain, dbFragment, fragmentFileObj) {
-      OPEN_DB[dbFragment] = new OpenDBEntry(dbMain, fragmentFileObj);
+      var k = openDbKey(dbMain, dbFragment);
+      OPEN_DB[k] = new OpenDBEntry(dbMain, fragmentFileObj);
+      OPEN_DB[k].properties.fragment = dbFragment;
     }
 
     /**
@@ -660,7 +956,7 @@
      * In-place updates must not roll just because the shard already has MAX_ENTRIES_COUNT rows.
      */
     function checkOpenDBSize(dbMain, dbFragment, entryId) {
-      const open = OPEN_DB[dbFragment];
+      const open = OPEN_DB[openDbKey(dbMain, dbFragment)];
       if (!open) return dbFragment;
       const { data } = open.toWrite;
       if (entryId != null) {
@@ -669,7 +965,7 @@
           return dbFragment;
         }
       }
-      if (Object.keys(data).length >= MAX_ENTRIES_COUNT) {
+      if (Object.keys(data).length >= instanceMaxEntries) {
         dbFragment = createNewCumulativeFragment(dbMain, dbFragment);
         openDBFragment(dbMain, dbFragment);
         return dbFragment;
@@ -708,6 +1004,37 @@
       const { fragmentsList } = properties;
       if (!fragmentsList || fragmentsList.length === 0) return null;
       return fragmentsList[fragmentsList.length - 1];
+    }
+
+    /**
+     * Pre-create one base fragment per partition key for `dbMain`.
+     *
+     * Call this once when setting up a new DB so that each event / tenant / category
+     * immediately owns its own shard — no INDEX lookup is needed for the first write
+     * or read on each partition.
+     *
+     * @param {string}   dbMain        — table name (must exist in INDEX)
+     * @param {string[]} partitionKeys — list of known partition values (e.g. event IDs)
+     */
+    function setupPartitions(dbMain, partitionKeys) {
+      if (!INDEX[dbMain]) throw new Error("setupPartitions: unknown dbMain: " + dbMain);
+      if (!isPartitioned(dbMain)) {
+        throw new Error(
+          "setupPartitions: dbMain '" + dbMain + "' has no partitionBy function. " +
+          "Pass partitionBy['" + dbMain + "'] in init() options."
+        );
+      }
+      var created = [];
+      for (var i = 0; i < partitionKeys.length; i++) {
+        var pk = String(partitionKeys[i]);
+        var frag = partitionBaseFragment(dbMain, pk);
+        if (!INDEX[dbMain].dbFragments[frag]) {
+          addInIndexFile(dbMain, frag);
+          created.push(frag);
+        }
+      }
+      if (created.length > 0) markIndexRoutingDirty(dbMain);
+      return created;
     }
 
     function getExternalConfig(key, { dbMain, dbFragment }) {
@@ -806,7 +1133,7 @@
           errors.push("could not open fragment: " + dbFragment);
           return;
         }
-        const open = OPEN_DB[dbFragment];
+        const open = OPEN_DB[openDbKey(dbMain, dbFragment)];
         const tw = open.toWrite;
         const data = tw.data || {};
         const index = tw.index || {};
@@ -827,12 +1154,17 @@
               errors.push("idRange.max mismatch " + dbFragment + " index=" + ir.max + " dataMax=" + dmax);
             }
           }
-          ids.forEach(function (nid) {
-            var ff = findFragmentForId(nid, dbMain);
-            if (ff !== dbFragment) {
-              errors.push("findFragmentForId(" + nid + ")=" + ff + " expected " + dbFragment);
-            }
-          });
+          // findFragmentForId relies on disjoint id ranges across all fragments.
+          // Partitioned tables have intentionally overlapping id ranges across
+          // different partitions, so skip this cross-check for partitioned dbMains.
+          if (!isPartitioned(dbMain)) {
+            ids.forEach(function (nid) {
+              var ff = findFragmentForId(nid, dbMain);
+              if (ff !== dbFragment) {
+                errors.push("findFragmentForId(" + nid + ")=" + ff + " expected " + dbFragment);
+              }
+            });
+          }
         } else if (fragMeta.idRange && fragMeta.idRange.min != null) {
           errors.push("empty data but idRange set for " + dbFragment);
         }
@@ -915,12 +1247,17 @@
       addExternalConfig: addExternalConfig,
       getIndexFootprint: getIndexFootprint,
       validateRoutingConsistency: validateRoutingConsistency,
+      setupPartitions: setupPartitions,
       /** @internal testing / advanced introspection */
       _routing: {
         findFragmentForId: findFragmentForId,
         findFragmentForKey: findFragmentForKey,
-        rebuildIdRangeSorted: rebuildIdRangeSorted
-      }
+        rebuildIdRangeSorted: rebuildIdRangeSorted,
+        openDbKey: openDbKey,
+        isPartitioned: isPartitioned,
+        partitionFragmentForKey: partitionFragmentForKey
+      },
+      maxEntriesCount: instanceMaxEntries
     };
   }
 

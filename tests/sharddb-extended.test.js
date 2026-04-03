@@ -38,9 +38,9 @@ describe("ShardDB extended", () => {
     it("sets isChanged on write and clears after saveToDBFiles", () => {
       const DB = SHARD_DB.init(INDEX_ID, mock.adapter);
       DB.addToDB({ key: "a", id: 1, v: 1 }, { dbMain: "USERS" });
-      assert.equal(DB.OPEN_DB.USERS_1.properties.isChanged, true);
+      assert.equal(DB.OPEN_DB[DB._routing.openDbKey("USERS", "USERS_1")].properties.isChanged, true);
       DB.saveToDBFiles();
-      assert.equal(DB.OPEN_DB.USERS_1.properties.isChanged, false);
+      assert.equal(DB.OPEN_DB[DB._routing.openDbKey("USERS", "USERS_1")].properties.isChanged, false);
     });
 
     it("saveToDBFiles with no dirty fragments performs no adapter writes", () => {
@@ -55,12 +55,12 @@ describe("ShardDB extended", () => {
       const DB = SHARD_DB.init(INDEX_ID, mock.adapter);
       DB.addToDB({ key: "a", id: 1, v: "persisted" }, { dbMain: "USERS" });
       DB.saveToDBFiles();
-      assert.ok(DB.OPEN_DB.USERS_1);
+      assert.ok(DB.OPEN_DB[DB._routing.openDbKey("USERS", "USERS_1")]);
       DB.closeDB({ dbMain: "USERS" });
-      assert.equal(DB.OPEN_DB.USERS_1, undefined);
+      assert.equal(DB.OPEN_DB[DB._routing.openDbKey("USERS", "USERS_1")], undefined);
       const row = DB.lookUpById(1, { dbMain: "USERS" });
       assert.equal(row.v, "persisted");
-      assert.ok(DB.OPEN_DB.USERS_1);
+      assert.ok(DB.OPEN_DB[DB._routing.openDbKey("USERS", "USERS_1")]);
     });
   });
 

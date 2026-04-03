@@ -82,7 +82,7 @@ describe("ShardDB 10k comprehensive API", () => {
 
       // ---- saveToDBFiles ----
       DB.saveToDBFiles();
-      assert.equal(DB.OPEN_DB.USERS_1.properties.isChanged, false);
+      assert.equal(DB.OPEN_DB[DB._routing.openDbKey("USERS", "USERS_1")].properties.isChanged, false);
 
       // ---- lookUpByKey ----
       assert.equal(DB.lookUpByKey("k_1", { dbMain: "USERS" }).email, "u1@seed.test");
@@ -137,7 +137,7 @@ describe("ShardDB 10k comprehensive API", () => {
       assert.equal(afterClose.email, "u5000@seed.test");
       const frag5 = DB._routing.findFragmentForId(5000, "USERS");
       assert.equal(frag5, "USERS_5");
-      assert.ok(DB.OPEN_DB.USERS_5);
+      assert.ok(DB.OPEN_DB[DB._routing.openDbKey("USERS", "USERS_5")]);
 
       // ---- clearDB: wipe shard data + routing for USERS ----
       DB.clearDB({ dbMain: "USERS" });
